@@ -1,4 +1,7 @@
+
+data/had/*
 .venv/
+venv/
 __pycache__/
 *.egg-info/
 .ipynb_checkpoints/
@@ -7,3 +10,6 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+
+data/predictions/*
+!data/predictions/.gitkeep

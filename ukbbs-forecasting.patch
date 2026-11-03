@@ -1,0 +1,713 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..1532d02
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,94 @@
++# UK BBS workflow
++
++A reproducible UK BBS preprocessing notebook plus a **small, model-agnostic
++forecasting interface**. Keep one notebook per experiment/model; share the
++split, fit/predict, and evaluation contract in `src/ukbbs/`.
++
++## Setup
++
++Python >= 3.11, from the project root:
++
++```bash
++python -m pip install -e '.[notebook]'
++python -m jupyter lab
++```
++
++Run `notebooks/01_download_and_preprocess.ipynb` first to generate
++`data/processed/ukbbs_model_data.csv` (raw files are downloaded by that
++notebook). Then open `notebooks/02_baseline_forecasting.ipynb` for a complete
++baseline experiment. Processed/raw datasets are intentionally not in Git.
++
++Run the offline tests with:
++
++```bash
++python -m unittest discover -s tests -v
++```
++
++## Standard forecasting contract
++
++```python
++from ukbbs import (
++    ForecastTask, LastValueForecaster, chronological_split, run_forecast,
++)
++
++task = ForecastTask()  # site + species, year, original UKBBS count column
++train, test = chronological_split(observations, train_through=2018, task=task)
++report = run_forecast(LastValueForecaster(), train, test, task)
++print(report.metrics)         # n_scored, n_unscored, mae, rmse, bias
++print(report.predictions)     # group/time keys, observed, prediction, residual
++```
++
++Or, to work directly with the same components in any notebook:
++
++```python
++from ukbbs import evaluate_forecasts
++
++model = LastValueForecaster().fit(train, task)
++future = test.drop(columns=[task.target])  # never pass the answer to the model
++predictions = model.predict(future)
++report = evaluate_forecasts(test, predictions, task)
++```
++
++**To add another method**, implement two methods on any class:
++
++- `fit(train: pd.DataFrame, task: ForecastTask) -> self`: train the method.
++- `predict(future: pd.DataFrame) -> pd.DataFrame`: return exactly one row per
++  future key (`task.keys`) plus a finite numeric `prediction` column. The
++  `future` frame has no target and may have extra covariates.
++
++This is a structural `ForecastModel` protocol: you don't need to subclass it.
++You can wrap ARIMA, scikit-learn, PyTorch, or a custom method in a class with
++these methods. Models are responsible for any required feature engineering.
++`run_forecast` works with any such model. Use `ForecastTask(target=...,
++ time_col=..., group_cols=(...))` for regional or alternative targets.
++
++`evaluate_forecasts` joins on keys, **not** row order, and rejects duplicate,
++missing, or unmatched keys and invalid predictions. Unobserved (null) test
++labels are reported but not scored; an observed count of zero **is** scored.
++Pass `metrics={"my_metric": callable}` to replace the built-in metrics;
++callables receive `(actual, prediction)` numeric NumPy arrays.
++
++## UK BBS and forecasting caveats
++
++- The preprocessor emits *observed* species–square–year rows. It does not
++  manufacture counts of zero for missing records. Use the notebook's
++  `sampled_square_years.csv` when separately deciding whether non-detections
++  can be represented as zeros. Never treat an unsurveyed year as zero.
++- A group's last observed target is carried forward by the example baseline.
++  Groups with no training history raise an error. In the baseline notebook,
++  we explicitly restrict evaluation to previously seen site/species groups.
++  Other methods can implement cold-start prediction if desired.
++- The chronological split uses actual calendar years and does not silently
++  compress omitted years (including excluded years 2001 and 2020).
++- For metadata experiments, add feature columns to train and future rows, but
++  use only features that **would be available at the forecast origin**. The
++  framework hides the test target; it cannot automatically detect leakage
++  through future-unknown covariates.
++- A `run_forecast` call requires every training timestamp to precede every
++  test timestamp. This covers standard holdout experiments; for rolling-origin
++  backtesting, call it separately for each chronological fold and aggregate
++  the resulting evaluations in your notebook.
++
++This patch only introduces the forecasting layer and example notebook. It does
++not alter the original downloaded source, preprocessing decisions, or the
++existing notebook's data-release metadata.
+diff --git a/notebooks/02_baseline_forecasting.ipynb b/notebooks/02_baseline_forecasting.ipynb
+new file mode 100644
+index 0000000..65d10e2
+--- /dev/null
++++ b/notebooks/02_baseline_forecasting.ipynb
+@@ -0,0 +1,156 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "id": "ea1f0f37",
++   "metadata": {},
++   "source": [
++    "# UK BBS · Baseline forecasting\n",
++    "\n",
++    "**Stage 2 — example notebook.** Each modelling method can have its own notebook,\n",
++    "while using the same data split, `fit/predict`, and evaluation functions.\n",
++    "\n",
++    "Run `01_download_and_preprocess.ipynb` first. This example uses the actual\n",
++    "observed counts; **no absent species–square–year is assumed to be a zero**."
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "a9ccdd3b",
++   "metadata": {},
++   "source": [
++    "## 1. Load processed observations\n",
++    "\n",
++    "The notebook works when Jupyter starts from the repository root or `notebooks/`.\n",
++    "The model input is an ordinary pandas DataFrame. Add metadata columns here in\n",
++    "future notebooks (taking care to use only information available at prediction time)."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "83e107da",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "from pathlib import Path\n",
++    "import sys\n",
++    "import pandas as pd\n",
++    "from IPython.display import display\n",
++    "\n",
++    "PROJECT_ROOT = next(\n",
++    "    (p for p in [Path.cwd(), *Path.cwd().parents]\n",
++    "     if (p / \"src\" / \"ukbbs\" / \"forecasting.py\").exists()),\n",
++    "    None,\n",
++    ")\n",
++    "if PROJECT_ROOT is None:\n",
++    "    raise RuntimeError(\"Open this notebook from inside the ukbbs-workflow repository\")\n",
++    "sys.path.insert(0, str(PROJECT_ROOT / \"src\"))\n",
++    "\n",
++    "from ukbbs import ForecastTask, LastValueForecaster, chronological_split, run_forecast\n",
++    "\n",
++    "csv_path = PROJECT_ROOT / \"data\" / \"processed\" / \"ukbbs_model_data.csv\"\n",
++    "if not csv_path.exists():\n",
++    "    raise FileNotFoundError(\"Run notebook 01 to create data/processed/ukbbs_model_data.csv\")\n",
++    "observations = pd.read_csv(csv_path, dtype={\"OS_GRID_REF\": \"string\", \"species\": \"string\"})\n",
++    "task = ForecastTask()\n",
++    "# Example species; choose another code to experiment with another species.\n",
++    "SPECIES = \"CU\"\n",
++    "observations = observations.loc[observations[\"species\"].eq(SPECIES)].copy()\n",
++    "if observations.empty:\n",
++    "    raise ValueError(f\"No observations for species {SPECIES!r}; select an available species\")\n",
++    "display(observations.head())"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "63763fc7",
++   "metadata": {},
++   "source": [
++    "## 2. Time-based holdout\n",
++    "\n",
++    "Training includes years up to and including the cutoff; evaluation uses later\n",
++    "observations. 2020 remains absent — it is **not** treated as an adjacent year.\n",
++    "This naive *per-series* model cannot forecast squares without training history,\n",
++    "so we explicitly evaluate only previously seen squares."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "0714dab0",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "train, test = chronological_split(observations, train_through=2018, task=task)\n",
++    "seen_groups = train[list(task.group_cols)].drop_duplicates()\n",
++    "test = test.merge(seen_groups, on=list(task.group_cols), how=\"inner\", validate=\"many_to_one\")\n",
++    "if test.empty:\n",
++    "    raise ValueError(\"No test groups have training history; choose another cutoff/species\")\n",
++    "print(f\"Training rows: {len(train):,}; held-out observed rows: {len(test):,}\")\n",
++    "print(f\"Training years: {train.year.min()}–{train.year.max()}\")\n",
++    "print(f\"Test years: {test.year.min()}–{test.year.max()}\")"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "f81d67fa",
++   "metadata": {},
++   "source": [
++    "## 3. Fit, predict and score using the shared interface\n",
++    "\n",
++    "Swap `LastValueForecaster()` for any class implementing `fit(train, task)` and\n",
++    "`predict(future)`. The runner removes test labels before invoking `predict`.\n",
++    "It returns keyed predictions, per-row errors, and MAE/RMSE/bias."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "9065bec4",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "model = LastValueForecaster()\n",
++    "report = run_forecast(model, train, test, task)\n",
++    "display(pd.Series(report.metrics, name=\"value\").to_frame())\n",
++    "display(report.predictions.head(10))"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "4f4b6c42",
++   "metadata": {},
++   "source": [
++    "## 4. Optional: save this experiment's outputs\n",
++    "\n",
++    "Keep output filenames distinct for separate modelling notebooks. The next\n",
++    "notebook can replace the model without changing the evaluator."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "37d69bee",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "output_path = PROJECT_ROOT / \"data\" / \"processed\" / \"baseline_predictions.csv\"\n",
++    "report.predictions.to_csv(output_path, index=False)\n",
++    "print(f\"Saved {output_path}\")"
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "name": "python"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
+diff --git a/src/ukbbs/__init__.py b/src/ukbbs/__init__.py
+index 866e098..d24cdcb 100644
+--- a/src/ukbbs/__init__.py
++++ b/src/ukbbs/__init__.py
+@@ -1 +1,14 @@
+-"""UK BBS preprocessing. Modelling will be added separately."""
++"""UK BBS preprocessing and reusable forecasting utilities."""
++
++from .evaluation import EvaluationResult, evaluate_forecasts, run_forecast
++from .forecasting import ForecastModel, ForecastTask, LastValueForecaster, chronological_split
++
++__all__ = [
++    "EvaluationResult",
++    "ForecastModel",
++    "ForecastTask",
++    "LastValueForecaster",
++    "chronological_split",
++    "evaluate_forecasts",
++    "run_forecast",
++]
+diff --git a/src/ukbbs/evaluation.py b/src/ukbbs/evaluation.py
+new file mode 100644
+index 0000000..f438765
+--- /dev/null
++++ b/src/ukbbs/evaluation.py
+@@ -0,0 +1,116 @@
++"""Reusable keyed forecast evaluation for independent experiment notebooks."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Callable, Mapping
++
++import numpy as np
++import pandas as pd
++
++from .forecasting import ForecastModel, ForecastTask, PREDICTION_COLUMN, validate_frame
++
++Metric = Callable[[np.ndarray, np.ndarray], float]
++
++
++def mae(actual: np.ndarray, predicted: np.ndarray) -> float:
++    return float(np.mean(np.abs(actual - predicted)))
++
++
++def rmse(actual: np.ndarray, predicted: np.ndarray) -> float:
++    return float(np.sqrt(np.mean((actual - predicted) ** 2)))
++
++
++def bias(actual: np.ndarray, predicted: np.ndarray) -> float:
++    """Mean signed error: observed minus predicted."""
++    return float(np.mean(actual - predicted))
++
++
++DEFAULT_METRICS: Mapping[str, Metric] = {"mae": mae, "rmse": rmse, "bias": bias}
++
++
++@dataclass
++class EvaluationResult:
++    """Metrics and row-level predictions; null actuals are unscored."""
++
++    metrics: dict[str, float | int]
++    predictions: pd.DataFrame
++
++
++def evaluate_forecasts(
++    actuals: pd.DataFrame,
++    forecasts: pd.DataFrame,
++    task: ForecastTask,
++    *,
++    metrics: Mapping[str, Metric] | None = None,
++) -> EvaluationResult:
++    """Join by series/time keys, never by row position.
++
++    Every actual row must have exactly one forecast and vice versa. Missing
++    actuals are retained as unscored; observed zero counts are scored normally.
++    No automatic imputation of missing UK BBS observations is performed.
++    """
++    validate_frame(actuals, task, labelled=True)
++    validate_frame(forecasts, task, labelled=False)
++    if PREDICTION_COLUMN not in forecasts.columns:
++        raise ValueError(f"Forecasts must include '{PREDICTION_COLUMN}'")
++    if len(actuals) != len(forecasts):
++        raise ValueError("Actual and forecast key sets differ")
++    aligned = actuals[[*task.keys, task.target]].merge(
++        forecasts[[*task.keys, PREDICTION_COLUMN]],
++        on=task.keys, how="left", sort=False, validate="one_to_one", indicator=True,
++    )
++    if aligned["_merge"].ne("both").any():
++        raise ValueError("Actual and forecast key sets differ")
++    aligned = aligned.drop(columns="_merge")
++
++    actual = pd.to_numeric(aligned[task.target], errors="raise").to_numpy(dtype=float)
++    predicted = pd.to_numeric(aligned[PREDICTION_COLUMN], errors="raise").to_numpy(dtype=float)
++    mask = ~np.isnan(actual)
++    if not np.isfinite(predicted).all() or not np.isfinite(actual[mask]).all():
++        raise ValueError("Predictions and observed targets must be finite")
++    if not mask.any():
++        raise ValueError("No observed test targets to score")
++
++    aligned[task.target] = actual
++    aligned[PREDICTION_COLUMN] = predicted
++    aligned["residual"] = actual - predicted  # null actual -> NaN residual
++    aligned["absolute_error"] = np.abs(aligned["residual"])
++    selected_metrics = DEFAULT_METRICS if metrics is None else metrics
++    scores: dict[str, float | int] = {
++        "n_scored": int(mask.sum()), "n_unscored": int((~mask).sum())
++    }
++    for name, metric in selected_metrics.items():
++        if name in scores:
++            raise ValueError(f"Reserved metric name: {name}")
++        value = float(metric(actual[mask], predicted[mask]))
++        if not np.isfinite(value):
++            raise ValueError(f"Metric {name!r} produced a nonfinite value")
++        scores[name] = value
++    return EvaluationResult(metrics=scores, predictions=aligned)
++
++
++def run_forecast(
++    model: ForecastModel,
++    train: pd.DataFrame,
++    test: pd.DataFrame,
++    task: ForecastTask,
++    *,
++    metrics: Mapping[str, Metric] | None = None,
++) -> EvaluationResult:
++    """Fit any compatible model, forecast without test labels, and evaluate.
++
++    Other test columns (such as future-known metadata) are passed to the model.
++    It is the notebook's responsibility to exclude future-unknown covariates.
++    """
++    validate_frame(train, task, labelled=True)
++    validate_frame(test, task, labelled=True)
++    try:
++        if not train[task.time_col].max() < test[task.time_col].min():
++            raise ValueError("Training timestamps must strictly precede test timestamps")
++    except TypeError as exc:
++        raise ValueError("Training and test timestamps must be comparable") from exc
++    model.fit(train.copy(), task)
++    future = test.drop(columns=task.target).copy()
++    predictions = model.predict(future)
++    return evaluate_forecasts(test, predictions, task, metrics=metrics)
+diff --git a/src/ukbbs/forecasting.py b/src/ukbbs/forecasting.py
+new file mode 100644
+index 0000000..3249b45
+--- /dev/null
++++ b/src/ukbbs/forecasting.py
+@@ -0,0 +1,155 @@
++"""Small, library-independent interface for notebook forecasting experiments.
++
++A model implements ``fit(train, task)`` and ``predict(future)``. Predictions
++must be keyed to the requested future rows and contain a ``prediction`` column.
++Models can use any other columns (e.g. known-in-advance metadata) they need.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Protocol, Self
++
++import numpy as np
++import pandas as pd
++
++from .preprocessing import COUNT_COLUMN
++
++PREDICTION_COLUMN = "prediction"
++
++
++@dataclass(frozen=True)
++class ForecastTask:
++    """Column conventions shared by a notebook's models and evaluator.
++
++    ``group_cols=()`` describes a single aggregate time series. Keep genuine
++    non-detections (observed zeros) distinct from unobserved square-years.
++    """
++
++    target: str = COUNT_COLUMN
++    time_col: str = "year"
++    group_cols: tuple[str, ...] = ("OS_GRID_REF", "species")
++
++    def __post_init__(self) -> None:
++        columns = (*self.group_cols, self.time_col, self.target)
++        if any(not isinstance(name, str) or not name for name in columns):
++            raise ValueError("Task columns must be non-empty strings")
++        if len(set(columns)) != len(columns):
++            raise ValueError("Task columns must be distinct")
++        if any(name in {PREDICTION_COLUMN, "residual", "absolute_error"} for name in columns):
++            raise ValueError("Task columns cannot use reserved evaluation column names")
++
++    @property
++    def keys(self) -> list[str]:
++        return [*self.group_cols, self.time_col]
++
++
++class ForecastModel(Protocol):
++    """Implement this contract to use a model with ``run_forecast``.
++
++    ``future`` includes keys and optional features, but *never* the target.
++    Return one row per future key with those keys and ``prediction``.
++    """
++
++    def fit(self, train: pd.DataFrame, task: ForecastTask) -> Self: ...
++
++    def predict(self, future: pd.DataFrame) -> pd.DataFrame: ...
++
++
++def validate_frame(frame: pd.DataFrame, task: ForecastTask, *, labelled: bool) -> None:
++    """Check keys and time representation; do not manufacture missing rows."""
++    if not isinstance(frame, pd.DataFrame):
++        raise TypeError("Expected a pandas DataFrame")
++    required = task.keys + ([task.target] if labelled else [])
++    missing = sorted(set(required) - set(frame.columns))
++    if missing:
++        raise ValueError(f"Missing required columns: {missing}")
++    if frame.empty:
++        raise ValueError("Forecast data must not be empty")
++    if frame[task.keys].isna().any().any():
++        raise ValueError("Forecast keys cannot be missing")
++    if frame.duplicated(task.keys).any():
++        raise ValueError(f"Duplicate forecast keys: {task.keys}")
++    times = frame[task.time_col]
++    if not (pd.api.types.is_numeric_dtype(times) or pd.api.types.is_datetime64_any_dtype(times)):
++        raise ValueError(f"{task.time_col} must be numeric or datetime, not strings")
++    if pd.api.types.is_numeric_dtype(times) and not np.isfinite(times.to_numpy(dtype=float)).all():
++        raise ValueError(f"{task.time_col} must contain finite values")
++
++
++def chronological_split(
++    observations: pd.DataFrame, *, train_through: int | float | pd.Timestamp,
++    task: ForecastTask,
++) -> tuple[pd.DataFrame, pd.DataFrame]:
++    """Train through an inclusive cutoff; test only strictly later periods.
++
++    The split does NOT fill years, construct zeros, or remove unknown groups.
++    Models decide whether they can forecast previously unseen groups.
++    """
++    validate_frame(observations, task, labelled=True)
++    try:
++        mask = observations[task.time_col].le(train_through)
++    except (TypeError, ValueError) as exc:
++        raise ValueError("train_through must be comparable to the time column") from exc
++    train, test = observations.loc[mask].copy(), observations.loc[~mask].copy()
++    if train.empty or test.empty:
++        raise ValueError("The temporal split must leave both training and test rows")
++    return train.reset_index(drop=True), test.reset_index(drop=True)
++
++
++class LastValueForecaster:
++    """Per-group naive baseline: repeat the last *observed* training target.
++
++    A training null is not converted to zero. Unknown groups are rejected, not
++    silently assigned a population-wide prediction. A future timestamp must
++    be after the last observed timestamp for its group.
++    """
++
++    def __init__(self) -> None:
++        self._task: ForecastTask | None = None
++        self._last: pd.DataFrame | None = None
++
++    def fit(self, train: pd.DataFrame, task: ForecastTask) -> Self:
++        validate_frame(train, task, labelled=True)
++        observed = train.loc[train[task.target].notna()].copy()
++        if observed.empty:
++            raise ValueError("Training data have no observed targets")
++        values = pd.to_numeric(observed[task.target], errors="raise").to_numpy(dtype=float)
++        if not np.isfinite(values).all():
++            raise ValueError("Training targets must be finite where observed")
++        observed[task.target] = values
++        ordered = observed.sort_values(task.time_col, kind="stable")
++        last = (ordered.groupby(list(task.group_cols), sort=False).tail(1)
++                if task.group_cols else ordered.tail(1))
++        self._last = last[[*task.group_cols, task.time_col, task.target]].rename(
++            columns={task.time_col: "_last_time", task.target: PREDICTION_COLUMN}
++        ).reset_index(drop=True)
++        self._task = task
++        return self
++
++    def predict(self, future: pd.DataFrame) -> pd.DataFrame:
++        if self._task is None or self._last is None:
++            raise RuntimeError("Call fit() before predict()")
++        task = self._task
++        validate_frame(future, task, labelled=False)
++        if task.target in future.columns:
++            raise ValueError("future must not contain the target (avoid leakage)")
++        request = future[task.keys].copy()
++        if task.group_cols:
++            joined = request.merge(
++                self._last, on=list(task.group_cols), how="left",
++                sort=False, validate="many_to_one", indicator=True,
++            )
++            if joined["_merge"].ne("both").any():
++                raise ValueError("No training history for one or more forecast groups")
++        else:
++            joined = request.assign(
++                _last_time=self._last["_last_time"].iloc[0],
++                prediction=self._last[PREDICTION_COLUMN].iloc[0],
++            )
++        try:
++            if joined[task.time_col].le(joined["_last_time"]).any():
++                raise ValueError("Future timestamps must follow each group's last observation")
++        except TypeError as exc:
++            raise ValueError("Training and future timestamps must be comparable") from exc
++        return joined[[*task.keys, PREDICTION_COLUMN]].copy()
+diff --git a/tests/test_forecasting.py b/tests/test_forecasting.py
+new file mode 100644
+index 0000000..c844c69
+--- /dev/null
++++ b/tests/test_forecasting.py
+@@ -0,0 +1,142 @@
++"""Offline tests for the shared model interface and evaluation contract."""
++
++import unittest
++
++import numpy as np
++import pandas as pd
++from pandas.testing import assert_frame_equal
++
++from ukbbs import (
++    ForecastTask, LastValueForecaster, chronological_split,
++    evaluate_forecasts, run_forecast,
++)
++
++
++class ForecastingTests(unittest.TestCase):
++    def setUp(self):
++        self.task = ForecastTask(target="count")
++        self.observations = pd.DataFrame([
++            ("A", "CU", 2018, 0.0, 3.0),
++            ("A", "CU", 2019, 4.0, 4.0),
++            ("B", "CU", 2018, 2.0, 6.0),
++            ("B", "CU", 2019, 6.0, 7.0),
++            ("A", "CU", 2021, 3.0, 3.0),
++            ("B", "CU", 2021, 0.0, 1.0),
++        ], columns=["OS_GRID_REF", "species", "year", "count", "known_weather"])
++
++    def test_end_to_end_last_value_metrics_and_rowwise_output(self):
++        train, test = chronological_split(self.observations, train_through=2019, task=self.task)
++        # No test label is passed to the model; labels exist only in the evaluator.
++        result = run_forecast(LastValueForecaster(), train, test, self.task)
++        self.assertEqual(result.metrics["n_scored"], 2)
++        self.assertEqual(result.metrics["n_unscored"], 0)
++        self.assertAlmostEqual(result.metrics["mae"], 3.5)
++        self.assertAlmostEqual(result.metrics["rmse"], np.sqrt(18.5))
++        self.assertAlmostEqual(result.metrics["bias"], -3.5)
++        self.assertEqual(result.predictions["prediction"].tolist(), [4.0, 6.0])
++        self.assertEqual(result.predictions["residual"].tolist(), [-1.0, -6.0])
++
++    def test_evaluation_matches_keys_not_position(self):
++        test = self.observations.query("year == 2021").copy()
++        predictions = test[[*self.task.keys]].iloc[::-1].copy()
++        predictions["prediction"] = [9.0, 2.0]  # B then A
++        result = evaluate_forecasts(test, predictions, self.task)
++        self.assertEqual(result.predictions["prediction"].tolist(), [2.0, 9.0])
++        self.assertEqual(result.metrics["n_scored"], 2)
++
++    def test_na_truth_is_not_zero_but_an_observed_zero_is_scored(self):
++        test = self.observations.query("year == 2021").copy()
++        test.loc[test.OS_GRID_REF.eq("A"), "count"] = np.nan
++        preds = test[self.task.keys].copy()
++        preds["prediction"] = [9.0, 2.0]
++        result = evaluate_forecasts(test, preds, self.task)
++        self.assertEqual(result.metrics["n_scored"], 1)
++        self.assertEqual(result.metrics["n_unscored"], 1)
++        self.assertEqual(result.metrics["mae"], 2)
++        self.assertTrue(np.isnan(result.predictions["residual"].iloc[0]))
++        self.assertEqual(result.predictions["count"].iloc[1], 0)
++
++    def test_unknown_group_requires_explicit_policy(self):
++        train, test = chronological_split(self.observations, train_through=2019, task=self.task)
++        unseen = test.copy()
++        unseen.loc[unseen.index[0], "OS_GRID_REF"] = "NEW"
++        with self.assertRaisesRegex(ValueError, "No training history"):
++            run_forecast(LastValueForecaster(), train, unseen, self.task)
++
++    def test_baseline_uses_last_observed_not_null_or_zero(self):
++        train = self.observations.query("year <= 2019").copy()
++        train.loc[train.OS_GRID_REF.eq("A") & train.year.eq(2019), "count"] = np.nan
++        test = self.observations.query("year == 2021").copy()
++        result = run_forecast(LastValueForecaster(), train, test, self.task)
++        self.assertEqual(result.predictions["prediction"].tolist(), [0.0, 6.0])
++
++    def test_future_cannot_contain_target_or_past_timestamp(self):
++        train, test = chronological_split(self.observations, train_through=2019, task=self.task)
++        model = LastValueForecaster().fit(train, self.task)
++        with self.assertRaisesRegex(ValueError, "target"):
++            model.predict(test)
++        with self.assertRaisesRegex(ValueError, "Future timestamps"):
++            model.predict(train.drop(columns="count"))
++
++    def test_custom_model_can_consume_metadata_and_custom_metric(self):
++        class MetadataModel:
++            def fit(self, train, task):
++                self.task = task
++                return self
++
++            def predict(self, future):
++                assert "count" not in future.columns  # guard against leakage
++                return future[self.task.keys].assign(prediction=future.known_weather)
++
++        train, test = chronological_split(self.observations, train_through=2019, task=self.task)
++        result = run_forecast(
++            MetadataModel(), train, test, self.task,
++            metrics={"max_abs_error": lambda y, yhat: np.max(np.abs(y-yhat))},
++        )
++        self.assertEqual(result.predictions["prediction"].tolist(), [3.0, 1.0])
++        self.assertEqual(result.metrics["max_abs_error"], 1)
++        self.assertNotIn("mae", result.metrics)
++
++    def test_custom_single_series_task(self):
++        task = ForecastTask(target="index", time_col="date", group_cols=())
++        observations = pd.DataFrame({
++            "date": pd.to_datetime(["2018-01-01", "2019-01-01", "2021-01-01"]),
++            "index": [5.0, 7.0, 8.0],
++        })
++        train, test = chronological_split(
++            observations, train_through=pd.Timestamp("2019-01-01"), task=task,
++        )
++        result = run_forecast(LastValueForecaster(), train, test, task)
++        self.assertEqual(result.metrics["mae"], 1.0)
++
++    def test_reject_duplicate_missing_unmatched_keys_and_invalid_prediction(self):
++        test = self.observations.query("year == 2021").copy()
++        forecasts = test[self.task.keys].assign(prediction=[3.0, 1.0])
++        with self.assertRaisesRegex(ValueError, "Duplicate forecast keys"):
++            evaluate_forecasts(test, pd.concat([forecasts, forecasts.iloc[:1]]), self.task)
++        with self.assertRaisesRegex(ValueError, "key sets differ"):
++            evaluate_forecasts(test, forecasts.assign(year=2022), self.task)
++        with self.assertRaisesRegex(ValueError, "finite"):
++            evaluate_forecasts(test, forecasts.assign(prediction=np.inf), self.task)
++        with self.assertRaisesRegex(ValueError, "cannot be missing"):
++            chronological_split(self.observations.assign(OS_GRID_REF=np.nan), train_through=2019, task=self.task)
++
++    def test_temporal_leakage_and_empty_split_rejected(self):
++        train = self.observations.query("year != 2018").copy()
++        test = self.observations.query("year == 2019").copy()
++        with self.assertRaisesRegex(ValueError, "strictly precede"):
++            run_forecast(LastValueForecaster(), train, test, self.task)
++        with self.assertRaisesRegex(ValueError, "leave both"):
++            chronological_split(self.observations, train_through=2030, task=self.task)
++
++    def test_model_interface_without_runner(self):
++        train, test = chronological_split(self.observations, train_through=2019, task=self.task)
++        model = LastValueForecaster().fit(train, self.task)
++        predicted = model.predict(test.drop(columns=self.task.target))
++        direct = evaluate_forecasts(test, predicted, self.task)
++        via_runner = run_forecast(LastValueForecaster(), train, test, self.task)
++        assert_frame_equal(direct.predictions, via_runner.predictions)
++
++
++if __name__ == "__main__":
++    unittest.main()
