@@ -68,6 +68,52 @@ labels are reported but not scored; an observed count of zero **is** scored.
 Pass `metrics={"my_metric": callable}` to replace the built-in metrics;
 callables receive `(actual, prediction)` numeric NumPy arrays.
 
+## Saving predictions by model and species
+
+After `run_forecast(...)`, store each species as a CSV while maintaining a
+human-readable lookup of model configurations:
+
+```python
+from ukbbs import save_forecast_results
+
+folder = save_forecast_results(
+    report,
+    output_root=PROJECT_ROOT / "data" / "predictions",
+    model_name="last_value",
+    model_params={},                 # e.g. {"lags": 3, "alpha": 0.1}
+    run_config={
+        "dataset_release": "YOUR_RELEASE_ID",
+        "train_through": 2018,
+        "test_through": 2024,
+    },
+    task=task,
+)
+print(folder)
+```
+
+Files are grouped as follows:
+
+```text
+data/predictions/
+├── index.json                 # model names -> hashes and folder names
+└── last-value__a1b2c3d4e5f6/
+    ├── manifest.json          # model name, parameters, task, run settings
+    ├── CU.csv                 # all CU predictions, observed values and errors
+    └── LK.csv                 # all LK predictions, observed values and errors
+```
+
+The folder hash is deterministic from the model name, parameters, task schema,
+and run configuration, **not the fitted model weights**. Include dataset
+version, split, preprocessing settings, random seed and other relevant
+experiment inputs in `run_config` so different runs don't collide. The species
+code is deliberately excluded from the hash, so separate species notebooks
+using the same configuration can populate the same model folder.
+
+Existing species files are not overwritten with different results unless you
+explicitly pass `overwrite=True`. Exact repeat saves are harmless. Filenames
+require species codes containing only ASCII letters, digits, `_` or `-`.
+Storage is intended for sequential notebook use, not concurrent writers.
+
 ## UK BBS and forecasting caveats
 
 - The preprocessor emits *observed* species–square–year rows. It does not

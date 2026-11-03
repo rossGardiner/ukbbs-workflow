@@ -1,21 +1,24 @@
+# Ignore everything by default
 *
+
+# Allow Git to traverse directories
+!*/
+
+# Allow source code
 !src/*.py
 !src/ukbbs/*.py
 
+# Allow tests
 !tests/*.py
+
+# Allow notebooks
 !notebooks/*.ipynb
 
-data/had/*
-.venv/
-venv/
-__pycache__/
-*.egg-info/
-.ipynb_checkpoints/
-.DS_Store
-data/raw/*
-!data/raw/.gitkeep
-data/processed/*
-!data/processed/.gitkeep
+# Allow project configuration
+!.gitignore
+!pyproject.toml
+!README.md
 
-data/predictions/*
-!data/predictions/.gitkeep
+# Ignore downloaded climate data
+data/had/
+data/
